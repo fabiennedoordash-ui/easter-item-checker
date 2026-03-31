@@ -55,9 +55,9 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
         run: |
-          ARGS="--items input/easter_items.csv"
-          ARGS="$ARGS --jets-photos input/jets_photos.csv"
-          ARGS="$ARGS --community-photos input/community_photos_urpc.csv input/community_photos_msid.csv"
+          ARGS="--items easter_items.csv"
+          ARGS="$ARGS --jets-photos jets_photos.csv"
+          ARGS="$ARGS --community-photos community_photos_urpc.csv community_photos_msid.csv"
           ARGS="$ARGS --max-items ${{ github.event.inputs.max_items }}"
           ARGS="$ARGS --offset ${{ github.event.inputs.offset }}"
           ARGS="$ARGS --max-jets ${{ github.event.inputs.max_jets }}"
