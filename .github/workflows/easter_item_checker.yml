@@ -54,6 +54,7 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
         run: |
           ARGS="--items easter_items.csv"
           ARGS="$ARGS --jets-photos jets_photos.csv"
