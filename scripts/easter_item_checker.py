@@ -212,6 +212,130 @@ def upload_to_imgbb(filepath, imgbb_key, item_name=''):
 
 
 # --------------------------------------------------------------------------
+# Google reference image search via SerpAPI
+# --------------------------------------------------------------------------
+
+def search_reference_images(item_name, serpapi_key, max_results=5):
+    """Search Google Images for product reference photos (ground truth for text check)."""
+    if not serpapi_key:
+        return []
+    clean_name = re.sub(r'\s*\([^)]*\)', '', item_name).strip()
+    query = f"{clean_name} product packaging"
+    logger.info(f"    [REF_SEARCH] Searching: {query}")
+    try:
+        resp = requests.get('https://serpapi.com/search', params={
+            'engine': 'google_images', 'q': query,
+            'api_key': serpapi_key, 'num': max_results * 2,
+        }, timeout=30)
+        resp.raise_for_status()
+        results = resp.json().get('images_results', [])
+    except Exception as e:
+        logger.info(f"    [REF_SEARCH] Search failed: {e}")
+        return []
+    if not results:
+        logger.info(f"    [REF_SEARCH] No results found")
+        return []
+    ref_images = []
+    for img_result in results:
+        if len(ref_images) >= max_results:
+            break
+        url = img_result.get('original') or img_result.get('thumbnail')
+        if not url:
+            continue
+        jpeg_bytes = download_image_as_jpeg(url, timeout=10, max_dimension=768)
+        if jpeg_bytes:
+            ref_images.append(jpeg_bytes)
+    logger.info(f"    [REF_SEARCH] Downloaded {len(ref_images)} reference images")
+    return ref_images
+
+
+# --------------------------------------------------------------------------
+# Final text check + blur against reference images
+# --------------------------------------------------------------------------
+
+FINAL_TEXT_CHECK_PROMPT = """I am providing you TWO images:
+
+REFERENCE IMAGE (first image): Shows the REAL product from a Google image search.
+OUTPUT IMAGE (second image): An AI-edited catalog photo we just created.
+
+Compare EVERY piece of text on the OUTPUT image against the REFERENCE image.
+
+RULES:
+- Every word on the output MUST match the reference exactly
+- Missing text is OK (less text than reference is acceptable)
+- But text that IS present must be spelled correctly and match the reference
+- Misspelled text = PROBLEM (e.g. "EDOS" instead of "EGGS", "ressalable" instead of "resealable")
+- Wrong words = PROBLEM (e.g. "ESS SOUND" instead of "VIA APP")
+- Hallucinated text (words not on reference at all) = PROBLEM
+- Blurry text that roughly matches = OK, not a problem
+- Very small text that is hard to read = OK if it roughly matches
+
+For each problem, describe WHERE on the packaging and what it should say.
+
+If all visible text matches (or is too blurry/small to read), respond: NO_ISSUES
+
+Otherwise respond with a list:
+- Location: "WRONG_TEXT" should be "CORRECT_TEXT" or should be blurred
+"""
+
+
+def final_text_check_and_blur(generated_img, ref_images, openai_key):
+    """Compare output text against Google reference images.
+    If any text is wrong/misspelled, blur those specific areas."""
+    if not ref_images or not openai_key:
+        return generated_img
+    gen_jpeg = _img_to_jpeg(generated_img)
+    try:
+        all_images = [ref_images[0], gen_jpeg]
+        raw = _openai_vision(FINAL_TEXT_CHECK_PROMPT, all_images, openai_key,
+                             max_tokens=300, detail="high")
+        if not raw or 'NO_ISSUES' in raw:
+            logger.info(f"    [FINAL_TEXT] All text matches reference")
+            return generated_img
+        logger.info(f"    [FINAL_TEXT] Text issues found: {raw[:150]}...")
+    except Exception as e:
+        logger.debug(f"    [FINAL_TEXT] Check failed: {e}")
+        return generated_img
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_key)
+        img = generated_img.convert('RGBA')
+        max_side = max(img.width, img.height)
+        square = Image.new("RGBA", (max_side, max_side), (255, 255, 255, 255))
+        square.paste(img, ((max_side - img.width) // 2, (max_side - img.height) // 2))
+        square.thumbnail((1024, 1024), Image.LANCZOS)
+        buf = io.BytesIO()
+        square.save(buf, format="PNG")
+        buf.seek(0)
+        buf.name = "source.png"
+        blur_prompt = (
+            f"This is a product catalog image. Some text on the product is "
+            f"incorrect or misspelled. BLUR (make unreadable) ONLY the following "
+            f"text areas while keeping everything else exactly the same:\n\n{raw}\n\n"
+            f"Do NOT change anything else. Do NOT remove, replace, or rewrite "
+            f"the text -- just make those specific areas blurry/unreadable. "
+            f"Keep all large correct text, product images, logos, and colors exactly as they are."
+        )
+        response = client.images.edit(
+            model="gpt-image-1", image=buf, prompt=blur_prompt, size="1024x1024"
+        )
+        if response.data and response.data[0].b64_json:
+            img_data = base64.b64decode(response.data[0].b64_json)
+            fixed = Image.open(io.BytesIO(img_data)).convert("RGB")
+            logger.info(f"    [FINAL_TEXT] Bad text blurred successfully")
+            return fixed
+        elif response.data and response.data[0].url:
+            img_resp = requests.get(response.data[0].url, timeout=30)
+            if img_resp.status_code == 200:
+                fixed = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+                logger.info(f"    [FINAL_TEXT] Bad text blurred successfully")
+                return fixed
+    except Exception as e:
+        logger.info(f"    [FINAL_TEXT] Blur fix failed: {e}")
+    return generated_img
+
+
+# --------------------------------------------------------------------------
 # JETS zip extraction
 # --------------------------------------------------------------------------
 
@@ -749,7 +873,7 @@ def process_community_photos(photos, item_name, openai_key, max_candidates=15):
 # --------------------------------------------------------------------------
 
 def process_item(item_info, jets_rows, community_photos,
-                 openai_key, output_img_dir, args):
+                 openai_key, serpapi_key, output_img_dir, args):
     """Process a single item: find best photo, crop, AI edit, save."""
     item_id = item_info['item_id']
     item_name = item_info['item_name']
@@ -851,6 +975,15 @@ def process_item(item_info, jets_rows, community_photos,
     generated = ai_background_removal(cropped_bytes, item_name, openai_key)
 
     if generated is not None:
+        # -- Step 6: Search Google for reference images & verify text ------
+        if serpapi_key:
+            ref_images = search_reference_images(item_name, serpapi_key)
+            result['refs_found'] = len(ref_images)
+            if ref_images:
+                generated = final_text_check_and_blur(generated, ref_images, openai_key)
+        else:
+            result['refs_found'] = 0
+
         catalog = make_catalog_ready(generated)
         out = output_img_dir / f"{item_id.replace('/', '_')}.jpg"
         catalog.save(out, "JPEG", quality=95)
@@ -891,6 +1024,8 @@ def main():
                         help='One or more community photos CSVs (MSID and/or DD_SIC based)')
     parser.add_argument('--output-dir', default='output')
     parser.add_argument('--openai-key', default=os.environ.get('OPENAI_API_KEY'))
+    parser.add_argument('--serpapi-key', default=os.environ.get('SERPAPI_KEY'),
+                        help='SerpAPI key for Google reference image search (or set SERPAPI_KEY)')
     parser.add_argument('--imgbb-key', default=os.environ.get('IMGBB_API_KEY'))
     parser.add_argument('--max-jets', type=int, default=10,
                         help='Max JETS photos to try per item')
@@ -910,6 +1045,8 @@ def main():
     if not args.openai_key:
         logger.error("OpenAI API key required. Set OPENAI_API_KEY or use --openai-key.")
         sys.exit(1)
+    if not args.serpapi_key:
+        logger.warning("No SerpAPI key -- text verification against reference images disabled.")
 
     output_dir = Path(args.output_dir)
     output_img_dir = output_dir / "images"
@@ -969,7 +1106,7 @@ def main():
                 merged_community.append(photo)
 
         result = process_item(item_info, jets_rows, merged_community,
-                              args.openai_key, output_img_dir, args)
+                              args.openai_key, args.serpapi_key, output_img_dir, args)
 
         # Upload to imgBB if fixed
         result['public_image_url'] = ''
@@ -991,7 +1128,7 @@ def main():
         'has_image', 'existing_photo_url', 'item_volume', 'avg_pick_time',
         'outcome', 'output_source', 'output_method', 'output_score', 'output_path',
         'url_used', 'public_image_url', 'imgbb_delete_url',
-        'jets_tried', 'jets_scored', 'community_tried', 'community_scored',
+        'refs_found', 'jets_tried', 'jets_scored', 'community_tried', 'community_scored',
     ]
     results_csv = output_dir / 'results.csv'
     with open(results_csv, 'w', newline='') as f:
