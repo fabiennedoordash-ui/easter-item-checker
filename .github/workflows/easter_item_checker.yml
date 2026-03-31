@@ -1,0 +1,106 @@
+name: Easter Item Checker
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_items:
+        description: 'Max items to process (0 = all)'
+        required: false
+        default: '20'
+      offset:
+        description: 'Skip first N items'
+        required: false
+        default: '0'
+      max_jets:
+        description: 'Max JETS photos per item'
+        required: false
+        default: '10'
+      max_community:
+        description: 'Max community photos per item'
+        required: false
+        default: '10'
+      skip_jets:
+        description: 'Skip JETS pass'
+        required: false
+        default: 'false'
+      skip_community:
+        description: 'Skip community photos pass'
+        required: false
+        default: 'false'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  check-easter-items:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests Pillow pillow-heif openai numpy
+
+      - name: Run Easter Item Checker
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
+        run: |
+          ARGS="--items input/easter_items.csv"
+          ARGS="$ARGS --jets-photos input/jets_photos.csv"
+          ARGS="$ARGS --community-photos input/community_photos_urpc.csv input/community_photos_msid.csv"
+          ARGS="$ARGS --max-items ${{ github.event.inputs.max_items }}"
+          ARGS="$ARGS --offset ${{ github.event.inputs.offset }}"
+          ARGS="$ARGS --max-jets ${{ github.event.inputs.max_jets }}"
+          ARGS="$ARGS --max-community ${{ github.event.inputs.max_community }}"
+
+          if [ "${{ github.event.inputs.skip_jets }}" = "true" ]; then
+            ARGS="$ARGS --skip-jets"
+          fi
+          if [ "${{ github.event.inputs.skip_community }}" = "true" ]; then
+            ARGS="$ARGS --skip-community"
+          fi
+
+          python scripts/easter_item_checker.py $ARGS
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: easter-results-offset-${{ github.event.inputs.offset }}
+          path: |
+            output/results.csv
+            output/images/
+          retention-days: 30
+
+      - name: Auto-chain next batch
+        if: success() && github.event.inputs.max_items != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_OFFSET=${{ github.event.inputs.offset }}
+          BATCH_SIZE=${{ github.event.inputs.max_items }}
+          NEXT_OFFSET=$((CURRENT_OFFSET + BATCH_SIZE))
+          TOTAL_ITEMS=200
+
+          if [ $NEXT_OFFSET -lt $TOTAL_ITEMS ]; then
+            echo "Triggering next batch: offset=$NEXT_OFFSET"
+            gh workflow run "Easter Item Checker" \
+              -f max_items=$BATCH_SIZE \
+              -f offset=$NEXT_OFFSET \
+              -f max_jets=${{ github.event.inputs.max_jets }} \
+              -f max_community=${{ github.event.inputs.max_community }} \
+              -f skip_jets=${{ github.event.inputs.skip_jets }} \
+              -f skip_community=${{ github.event.inputs.skip_community }}
+          else
+            echo "All items processed (offset $NEXT_OFFSET >= $TOTAL_ITEMS)"
+          fi
